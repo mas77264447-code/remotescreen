@@ -3,125 +3,189 @@ package com.example.remotescreen
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.PixelFormat
-import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
-import android.media.ImageReader
-import android.media.projection.MediaProjection
-import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
-import android.util.DisplayMetrics
-import android.util.Log
-import android.view.WindowManager
 import androidx.core.app.NotificationCompat
+import org.json.JSONObject
 
 class ScreenCaptureService : Service() {
 
     companion object {
-        const val ACTION_START = "com.example.remotescreen.START"
-        const val EXTRA_RESULT_CODE = "result_code"
+        const val ACTION_START = "start"
+        const val ACTION_STOP = "stop"
+        const val ACTION_DECIDE = "decide"
+        const val ACTION_SET_PASSWORD = "set_password"
+
         const val EXTRA_RESULT_DATA = "result_data"
-        private const val TAG = "ScreenCapture"
-        private const val CHANNEL_ID = "capture"
-        private const val NOTIF_ID = 1
+        const val EXTRA_FROM = "from"
+        const val EXTRA_ACCEPT = "accept"
+        const val EXTRA_REMEMBER = "remember"
+        const val EXTRA_PASSWORD = "password"
+
+        private const val NOTIF_FG = 1
+        private const val CH_FG = "fg"
+        private const val CH_REQ = "req"
+
+        // تُعيّنها الواجهة لعرض الحالة، وتُلغى عند إخفائها
+        var onStatus: ((String) -> Unit)? = null
     }
 
-    private var projection: MediaProjection? = null
-    private var virtualDisplay: VirtualDisplay? = null
-    private var imageReader: ImageReader? = null
-    private var frameCount = 0L
+    private lateinit var identity: Identity
+    private var signal: SignalClient? = null
+    private var sender: RtcSender? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        identity = Identity(this)
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action != ACTION_START) return START_NOT_STICKY
-
-        // يجب استدعاء startForeground قبل أي عملية أخرى (Android 14 يشترط نوع الخدمة)
-        startAsForeground()
-
-        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
-        val data: Intent? = intent.getParcelableExtra(EXTRA_RESULT_DATA)
-        if (data == null) {
-            Log.e(TAG, "no projection data")
-            stopSelf()
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_START -> start(intent)
+            ACTION_STOP -> stopSharing()
+            ACTION_DECIDE -> decide(intent)
+            ACTION_SET_PASSWORD -> signal?.send(
+                JSONObject().put("type", "set_password").put("password", intent.getStringExtra(EXTRA_PASSWORD) ?: "")
+            )
         }
-
-        val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        projection = mpm.getMediaProjection(resultCode, data)
-        // Android 14+: يجب تسجيل callback قبل إنشاء VirtualDisplay
-        projection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() {
-                Log.d(TAG, "projection stopped by system or user")
-                stopSelf()
-            }
-        }, null)
-
-        startCapture()
         return START_NOT_STICKY
     }
 
-    private fun startCapture() {
-        val metrics = DisplayMetrics()
-        (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(metrics)
+    private fun start(intent: Intent) {
+        ensureChannels()
+        startForegroundCompat(buildNotification("جارٍ التشغيل..."))
 
-        // نصف الدقة لتقليل الحمل في هذه المرحلة
-        val width = metrics.widthPixels / 2
-        val height = metrics.heightPixels / 2
-        val density = metrics.densityDpi
-
-        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2).apply {
-            setOnImageAvailableListener({ reader ->
-                reader.acquireLatestImage()?.use { image ->
-                    frameCount++
-                    if (frameCount % 60 == 0L) {
-                        Log.d(TAG, "frames captured: $frameCount, size: ${image.width}x${image.height}")
-                    }
-                }
-            }, null)
+        @Suppress("DEPRECATION")
+        val data: Intent = intent.getParcelableExtra(EXTRA_RESULT_DATA) ?: run {
+            stopSelf(); return
         }
 
-        virtualDisplay = projection?.createVirtualDisplay(
-            "RemoteScreen",
-            width, height, density,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader!!.surface,
-            null, null
+        sender?.release()
+        sender = RtcSender(
+            this,
+            data,
+            { to, payload -> signal?.send(JSONObject().put("type", "signal").put("to", to).put("data", payload)) },
+            { emit("متصل بالخادم، الرمز: ${identity.deviceId ?: "..."}") }
         )
-        Log.d(TAG, "capture started ${width}x${height}")
+        connectSignal()
     }
 
-    private fun startAsForeground() {
-        val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            manager.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "مشاركة الشاشة", NotificationManager.IMPORTANCE_LOW)
-            )
+    private fun connectSignal() {
+        signal?.close()
+        signal = SignalClient(Config.SERVER_URL, ::onServerMessage) {
+            val msg = JSONObject().put("type", "register").put("secret", identity.secret)
+            identity.deviceId?.let { msg.put("id", it) }
+            signal?.send(msg)
         }
-        val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("مشاركة الشاشة نشطة")
+        signal?.connect()
+        emit("جارٍ الاتصال بالخادم...")
+    }
+
+    private fun onServerMessage(m: JSONObject) {
+        when (m.optString("type")) {
+            "registered" -> {
+                val id = m.getString("id")
+                identity.saveId(id)
+                emit("الرمز: $id")
+            }
+            "password_set" -> emit("تم ضبط كلمة المرور")
+            "incoming" -> showRequest(m.getString("from"))
+            "peer_connected" -> sender?.start(m.getString("peer"))
+            "signal" -> {
+                val from = m.getString("from")
+                if (sender?.peer() == from) sender?.onRemoteSignal(m.getJSONObject("data"))
+            }
+            "hangup", "revoked" -> sender?.close()
+            "error" -> emit("خطأ: ${m.optString("message")}")
+        }
+    }
+
+    private fun decide(intent: Intent) {
+        val from = intent.getStringExtra(EXTRA_FROM) ?: return
+        val accept = intent.getBooleanExtra(EXTRA_ACCEPT, false)
+        val remember = intent.getBooleanExtra(EXTRA_REMEMBER, false)
+
+        signal?.send(
+            JSONObject().put("type", "decision").put("to", from)
+                .put("accept", accept).put("remember", remember)
+        )
+        if (accept) sender?.start(from)
+        getSystemService(NotificationManager::class.java).cancel(from.hashCode())
+    }
+
+    private fun showRequest(from: String) {
+        fun action(label: String, accept: Boolean, remember: Boolean, code: Int): NotificationCompat.Action {
+            val i = Intent(this, ScreenCaptureService::class.java).apply {
+                action = ACTION_DECIDE
+                putExtra(EXTRA_FROM, from)
+                putExtra(EXTRA_ACCEPT, accept)
+                putExtra(EXTRA_REMEMBER, remember)
+            }
+            val pi = PendingIntent.getService(
+                this, code, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            return NotificationCompat.Action(0, label, pi)
+        }
+
+        val n = NotificationCompat.Builder(this, CH_REQ)
+            .setContentTitle("طلب اتصال من الجهاز $from")
+            .setContentText("هل تسمح بمشاركة الشاشة؟")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .addAction(action("قبول", true, false, from.hashCode() + 1))
+            .addAction(action("قبول دائم", true, true, from.hashCode() + 2))
+            .addAction(action("رفض", false, false, from.hashCode() + 3))
+            .build()
+
+        getSystemService(NotificationManager::class.java).notify(from.hashCode(), n)
+    }
+
+    private fun stopSharing() {
+        sender?.release(); sender = null
+        signal?.close(); signal = null
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun emit(text: String) {
+        onStatus?.invoke(text)
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIF_FG, buildNotification(text))
+    }
+
+    private fun buildNotification(text: String): Notification =
+        NotificationCompat.Builder(this, CH_FG)
+            .setContentTitle("مشاركة الشاشة")
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setOngoing(true)
             .build()
 
+    private fun startForegroundCompat(n: Notification) {
         if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+            startForeground(NOTIF_FG, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         } else {
-            startForeground(NOTIF_ID, notification)
+            startForeground(NOTIF_FG, n)
         }
     }
 
+    private fun ensureChannels() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(NotificationChannel(CH_FG, "حالة المشاركة", NotificationManager.IMPORTANCE_LOW))
+        nm.createNotificationChannel(NotificationChannel(CH_REQ, "طلبات الاتصال", NotificationManager.IMPORTANCE_HIGH))
+    }
+
     override fun onDestroy() {
-        virtualDisplay?.release()
-        imageReader?.close()
-        projection?.stop()
-        virtualDisplay = null
-        imageReader = null
-        projection = null
+        sender?.release(); sender = null
+        signal?.close(); signal = null
         super.onDestroy()
     }
 }

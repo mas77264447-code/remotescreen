@@ -16,8 +16,23 @@
         android:id="@+id/btnStop"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_marginTop="16dp"
+        android:layout_marginTop="12dp"
         android:text="إيقاف" />
+
+    <EditText
+        android:id="@+id/edtPassword"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:hint="كلمة مرور الوصول (6 أحرف على الأقل)"
+        android:inputType="textPassword" />
+
+    <Button
+        android:id="@+id/btnSetPassword"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="حفظ كلمة المرور" />
 
     <TextView
         android:id="@+id/txtStatus"
